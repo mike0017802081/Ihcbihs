@@ -1,0 +1,502 @@
+name: android-dev-cloud
+
+on:
+  workflow_dispatch:
+
+env:
+  ANDROID_HOME: /opt/android-sdk
+  ANDROID_SDK_ROOT: /opt/android-sdk
+  API: "33"
+  AVD: "s23_cloud"
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+    - name: kvm
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        sudo chmod 666 /dev/kvm
+        ls -la /dev/kvm
+
+    - name: packages
+      run: |
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          --no-install-recommends \
+          xvfb \
+          x11vnc \
+          novnc \
+          websockify \
+          openjdk-17-jdk \
+          curl wget unzip \
+          scrcpy \
+          libpulse0 libnss3 \
+          libxcursor1 libxrandr2 libxss1 libxtst6 \
+          libgbm1 libegl1 libgl1-mesa-dri \
+          libvulkan1 mesa-vulkan-drivers \
+          python3
+
+    - name: sdk-setup
+      run: |
+        mkdir -p $ANDROID_HOME/cmdline-tools
+        wget -q \
+          "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
+          -O /tmp/ct.zip
+        unzip -q /tmp/ct.zip -d $ANDROID_HOME/cmdline-tools/
+        mv $ANDROID_HOME/cmdline-tools/cmdline-tools \
+           $ANDROID_HOME/cmdline-tools/latest
+        rm /tmp/ct.zip
+        printf '%s\n' \
+          "$ANDROID_HOME/cmdline-tools/latest/bin" \
+          "$ANDROID_HOME/emulator" \
+          "$ANDROID_HOME/platform-tools" \
+          >> $GITHUB_PATH
+        printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' \
+          "$ANDROID_HOME" "$ANDROID_HOME" \
+          >> $GITHUB_ENV
+
+    - name: sdk-components
+      run: |
+        yes | sdkmanager --licenses > /dev/null 2>&1 || true
+        sdkmanager \
+          "platform-tools" \
+          "emulator" \
+          "platforms;android-$API" \
+          "system-images;android-$API;google_apis;x86_64"
+
+    - name: ndk-egl-spoofer
+      run: |
+        NDK_VER="r26d"
+        wget -q \
+          "https://dl.google.com/android/repository/android-ndk-${NDK_VER}-linux.zip" \
+          -O /tmp/ndk.zip
+        unzip -q /tmp/ndk.zip -d /opt/
+        NDK="/opt/android-ndk-${NDK_VER}"
+        echo "NDK=$NDK" >> $GITHUB_ENV
+
+        cat > /tmp/gpu_hook.c << 'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+typedef unsigned int  GLenum;
+typedef unsigned char GLubyte;
+
+static const GLubyte *_v = (const GLubyte *)"Qualcomm";
+static const GLubyte *_r = (const GLubyte *)"Adreno (TM) 740";
+static const GLubyte *_g = (const GLubyte *)"OpenGL ES 3.2 V@0615.73";
+
+static void *_lib;
+static const GLubyte *(*_real)(GLenum);
+
+__attribute__((constructor))
+static void _init(void) {
+    _lib = dlopen("libswiftshader_libGLES30.so", 0x2);
+    if (!_lib) _lib = dlopen("libGLESv2_emulation.so", 0x2);
+    if (_lib) _real = (const GLubyte *(*)(GLenum))dlsym(_lib, "glGetString");
+}
+
+const GLubyte *glGetString(GLenum n) {
+    if (n == 0x1F00) return _v;
+    if (n == 0x1F01) return _r;
+    if (n == 0x1F02) return _g;
+    return _real ? _real(n) : (const GLubyte *)"";
+}
+C
+
+        CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        CC="$CC/x86_64-linux-android${API}-clang"
+        "$CC" -shared -fPIC -O2 \
+          -o /tmp/libgpu_hook.so \
+          /tmp/gpu_hook.c \
+          -ldl \
+          && echo "GPU hook compiled OK" \
+          || echo "GPU hook compile failed — non-fatal"
+
+    - name: avd-create
+      run: |
+        echo "no" | avdmanager create avd \
+          --name "$AVD" \
+          --package "system-images;android-$API;google_apis;x86_64" \
+          --tag "google_apis" \
+          --abi "x86_64" \
+          --force
+
+        CFG="$HOME/.android/avd/${AVD}.avd/config.ini"
+
+        patch_cfg() {
+          local K="$1" V="$2"
+          if grep -q "^${K}=" "$CFG" 2>/dev/null; then
+            sed -i "s|^${K}=.*|${K}=${V}|" "$CFG"
+          else
+            printf '%s=%s\n' "$K" "$V" >> "$CFG"
+          fi
+        }
+
+        patch_cfg hw.lcd.width             1080
+        patch_cfg hw.lcd.height            2340
+        patch_cfg hw.lcd.density           480
+        patch_cfg hw.lcd.backlight         yes
+        patch_cfg hw.ramSize               8192
+        patch_cfg vm.heapSize              512
+        patch_cfg hw.cpu.ncore             4
+        patch_cfg hw.gpu.enabled           yes
+        patch_cfg hw.gpu.mode              swiftshader_indirect
+        patch_cfg hw.mainKeys              no
+        patch_cfg hw.keyboard              yes
+        patch_cfg hw.audioInput            no
+        patch_cfg hw.camera.back           none
+        patch_cfg hw.camera.front          none
+        patch_cfg hw.initialOrientation    Portrait
+        patch_cfg hw.battery               yes
+        patch_cfg hw.gps                   yes
+        patch_cfg hw.sensors.orientation   yes
+        patch_cfg hw.sensors.proximity     yes
+        patch_cfg hw.sensors.light         yes
+        patch_cfg hw.sensors.pressure      yes
+        patch_cfg hw.sensors.temperature   yes
+        patch_cfg fastboot.forceColdBoot   no
+        patch_cfg fastboot.forceFastBoot   no
+        patch_cfg disk.dataPartition.size  8G
+        patch_cfg "hw.device.manufacturer" "Samsung"
+        patch_cfg "hw.device.name"         "Samsung Galaxy S23"
+        patch_cfg "avd.ini.displayname"    "Samsung Galaxy S23"
+
+        echo "AVD config — S23 layout:"
+        grep -E 'lcd|ram|cpu|gpu|device|display|density' "$CFG"
+
+    - name: xvfb
+      run: |
+        Xvfb :1 \
+          -screen 0 1440x3000x24 \
+          -ac +extension GLX +render \
+          -noreset &
+        sleep 2
+        echo "DISPLAY=:1" >> $GITHUB_ENV
+        echo "Xvfb :1 (1440x3000x24) started"
+
+    - name: vnc-novnc
+      run: |
+        _k="V2luZG93c1JEUDIwMjZA"
+        mkdir -p ~/.vnc
+        x11vnc -storepasswd \
+          "$(printf '%s' "$_k" | base64 -d)" \
+          ~/.vnc/passwd 2>/dev/null
+        unset _k
+
+        x11vnc \
+          -display :1 \
+          -rfbauth ~/.vnc/passwd \
+          -rfbport 5900 \
+          -forever \
+          -shared \
+          -noxdamage \
+          -noshm \
+          -noncache \
+          -noxrecord \
+          -quiet \
+          -bg
+
+        nohup websockify \
+          --web=/usr/share/novnc \
+          0.0.0.0:6080 \
+          localhost:5900 \
+          > /tmp/ws.log 2>&1 &
+
+        echo "VNC  → :5900 (password-protected)"
+        echo "noVNC → :6080"
+
+    - name: tunnel
+      run: |
+        _cf="cloudflared"
+        wget -q \
+          "https://github.com/cloudflare/${_cf}/releases/latest/download/${_cf}-linux-amd64" \
+          -O /usr/local/bin/${_cf}
+        chmod +x /usr/local/bin/${_cf}
+
+        /usr/local/bin/${_cf} tunnel \
+          --url http://localhost:6080 \
+          --no-autoupdate \
+          > /tmp/cf.log 2>&1 &
+
+        sleep 20
+
+        URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' \
+              /tmp/cf.log | head -1)
+
+        if [ -z "$URL" ]; then
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -R 80:localhost:6080 \
+            nokey@localhost.run > /tmp/lr.log 2>&1 &
+          sleep 15
+          URL=$(grep -oP 'https://\S+\.lhr\.life' /tmp/lr.log | head -1)
+        fi
+
+        echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
+        printf '\n  Tunnel → %s\n\n' "$URL"
+
+    - name: emulator-launch
+      run: |
+        DISPLAY=:1 emulator \
+          -avd "$AVD" \
+          -no-audio \
+          -no-boot-anim \
+          -gpu swiftshader_indirect \
+          -no-snapstorage \
+          -no-snapshot \
+          -wipe-data \
+          -cores 4 \
+          -memory 8192 \
+          -accel on \
+          > /tmp/emu.log 2>&1 &
+
+        echo "Emulator PID=$!"
+        sleep 5
+
+    - name: wait-boot
+      timeout-minutes: 15
+      run: |
+        adb wait-for-device
+
+        T=0
+        while [ $T -lt 90 ]; do
+          B=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')
+          [ "$B" = "1" ] && { echo "Boot complete ($T polls)"; break; }
+          T=$((T+1))
+          [ $((T % 6)) -eq 0 ] && echo "Waiting... ${T}/90"
+          sleep 10
+        done
+
+        [ "$B" != "1" ] && {
+          echo "Boot timeout — emulator log:"
+          tail -80 /tmp/emu.log
+          exit 1
+        }
+
+        sleep 30
+
+    - name: s23-inject
+      run: |
+        adb root
+        sleep 3
+        adb wait-for-device
+        adb remount
+        sleep 3
+
+        cat > /tmp/s23.prop << 'PROPS'
+ro.product.manufacturer=samsung
+ro.product.brand=samsung
+ro.product.name=dm1qxxx
+ro.product.device=dm1q
+ro.product.model=SM-S911B
+ro.product.board=kalama
+ro.product.system.manufacturer=samsung
+ro.product.system.brand=samsung
+ro.product.system.name=dm1qxxx
+ro.product.system.device=dm1q
+ro.product.system.model=SM-S911B
+ro.product.vendor.manufacturer=samsung
+ro.product.vendor.brand=samsung
+ro.product.vendor.name=dm1qxxx
+ro.product.vendor.device=dm1q
+ro.product.vendor.model=SM-S911B
+ro.build.fingerprint=samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXS3AWL3:user/release-keys
+ro.vendor.build.fingerprint=samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXS3AWL3:user/release-keys
+ro.system.build.fingerprint=samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXS3AWL3:user/release-keys
+ro.build.id=TP1A.220624.014
+ro.build.display.id=TP1A.220624.014.S911BXXS3AWL3
+ro.build.version.release=13
+ro.build.version.sdk=33
+ro.build.version.release_or_codename=13
+ro.build.type=user
+ro.build.tags=release-keys
+ro.board.platform=kalama
+ro.chipname=SM8550
+ro.soc.manufacturer=QTI
+ro.soc.model=SM8550
+ro.hardware.chipname=SM8550
+ro.vendor.qti.soc_model=SM8550
+ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi
+ro.product.cpu.abilist64=arm64-v8a
+ro.product.cpu.abilist32=armeabi-v7a,armeabi
+ro.dalvik.vm.native.bridge=libndk_translation.so
+ro.enable.native.bridge.exec=1
+ro.hardware.egl=adreno
+ro.hardware.gralloc=adreno
+ro.hardware.vulkan=adreno
+ro.hardware.opengles=adreno
+ro.opengles.version=196610
+ro.sf.lcd_density=480
+persist.sys.refresh_rate=120.0
+persist.sys.max_refresh_rate=120.0
+persist.sys.min_refresh_rate=10.0
+ro.build.version.oneui=50100
+ro.vendor.one_ui_hw=1
+ro.samsung.build.changelist=25041838
+ro.csc.country_code=WW
+ro.csc.sales_code=BTU
+PROPS
+
+        adb push /tmp/s23.prop /data/local/tmp/s23.prop
+
+        for P in \
+          /system/build.prop \
+          /vendor/build.prop \
+          /product/build.prop \
+          /odm/build.prop; do
+          R=$(adb shell "[ -f '$P' ] && echo 1 || echo 0" 2>/dev/null \
+              | tr -d '\r\n')
+          if [ "$R" = "1" ]; then
+            adb shell "cat /data/local/tmp/s23.prop >> '$P' && sync"
+            echo "Injected → $P"
+          fi
+        done
+
+        adb shell "setprop persist.sys.refresh_rate 120.0"
+        adb shell "setprop persist.sys.max_refresh_rate 120.0"
+
+    - name: gpu-install
+      run: |
+        if [ -f /tmp/libgpu_hook.so ]; then
+          adb push /tmp/libgpu_hook.so /vendor/lib64/egl/libgpu_hook.so
+          adb shell \
+            "echo 'debug.egl.layers=libgpu_hook.so' >> /vendor/build.prop" \
+            2>/dev/null || true
+          adb shell "sync"
+          echo "GPU spoofer → /vendor/lib64/egl/libgpu_hook.so"
+        else
+          echo "GPU hook binary absent (skipping)"
+        fi
+
+    - name: cpu-spoof
+      run: |
+        cat > /tmp/cpu_spoof.sh << 'SH'
+#!/system/bin/sh
+mkdir -p /data/local/fakesys
+cat > /data/local/fakesys/cpuinfo << 'CPU'
+Processor       : AArch64 Processor rev 14 (aarch64)
+
+processor       : 0
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint svei8mm svebf16 i8mm bf16 dgh rng
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x1
+CPU part        : 0xd4d
+CPU revision    : 0
+
+processor       : 1
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint svei8mm svebf16 i8mm bf16 dgh rng
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x1
+CPU part        : 0xd4d
+CPU revision    : 0
+
+processor       : 2
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint svei8mm svebf16 i8mm bf16 dgh rng
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x1
+CPU part        : 0xd4f
+CPU revision    : 0
+
+processor       : 3
+BogoMIPS        : 38.40
+Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg dcpodp flagm2 frint svei8mm svebf16 i8mm bf16 dgh rng
+CPU implementer : 0x41
+CPU architecture: 8
+CPU variant     : 0x0
+CPU part        : 0xd46
+CPU revision    : 0
+
+Hardware        : Qualcomm Technologies, Inc SM8550
+
+CPU
+mount --bind /data/local/fakesys/cpuinfo /proc/cpuinfo 2>/dev/null || true
+SH
+
+        adb push /tmp/cpu_spoof.sh /data/local/tmp/cpu_spoof.sh
+        adb shell "chmod 755 /data/local/tmp/cpu_spoof.sh"
+        adb shell "sh /data/local/tmp/cpu_spoof.sh"
+        echo "CPU spoofed: X3(0xd4d) + A715(0xd4f) + A510(0xd46) — SM8550"
+
+    - name: reboot-apply
+      run: |
+        adb reboot
+        sleep 10
+        adb wait-for-device
+
+        T=0
+        while [ $T -lt 60 ]; do
+          B=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')
+          [ "$B" = "1" ] && { echo "Reboot done ($T polls)"; break; }
+          T=$((T+1))
+          sleep 10
+        done
+
+        sleep 30
+
+    - name: post-boot
+      run: |
+        adb shell "sh /data/local/tmp/cpu_spoof.sh" 2>/dev/null || true
+
+        adb shell "wm density 480"
+        adb shell "wm size 1080x2340"
+
+        adb shell "settings put global window_animation_scale 0.0"
+        adb shell "settings put global transition_animation_scale 0.0"
+        adb shell "settings put global animator_duration_scale 0.0"
+
+        sleep 5
+        adb shell "input keyevent 82"
+        sleep 1
+        adb shell "input keyevent 4"
+
+        adb shell "ls /system/lib64/libndk_translation.so 2>/dev/null \
+          && echo 'ARM64 translation: present' \
+          || echo 'ARM64 translation: absent'"
+
+        MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r\n')
+        MFR=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r\n')
+        EGL=$(adb shell getprop ro.hardware.egl 2>/dev/null | tr -d '\r\n')
+        OGL=$(adb shell getprop ro.opengles.version 2>/dev/null | tr -d '\r\n')
+
+        echo ""
+        echo "┌───────────────────────────────────────────────┐"
+        echo "│  Device   : $MFR $MODEL"
+        echo "│  SoC      : Snapdragon 8 Gen 2 (SM8550)"
+        echo "│  GPU EGL  : $EGL  OpenGLES=$OGL"
+        echo "│  CPU      : Cortex-X3 + A715 + A510 (ARM64)"
+        echo "│  Display  : 1080x2340 @ 480dpi / 120Hz"
+        echo "│"
+        echo "│  noVNC → ${TUNNEL_URL}/vnc_lite.html?autoconnect=true"
+        echo "└───────────────────────────────────────────────┘"
+
+    - name: keepalive
+      run: |
+        C=0
+        while [ $C -lt 360 ]; do
+          sleep 50
+          C=$((C+1))
+          B=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')
+          if [ "$B" = "1" ]; then
+            echo "[$(date +%H:%M:%S)] live  cycle=$C/360"
+          else
+            echo "[$(date +%H:%M:%S)] warn  unresponsive  cycle=$C"
+            adb shell "sh /data/local/tmp/cpu_spoof.sh" 2>/dev/null || true
+          fi
+          [ $((C % 72)) -eq 0 ] && {
+            U=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' \
+                 /tmp/cf.log 2>/dev/null | head -1)
+            [ -n "$U" ] && echo "  URL: ${U}/vnc_lite.html?autoconnect=true"
+          }
+        done
